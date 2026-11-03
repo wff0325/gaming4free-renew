@@ -1,4 +1,4 @@
-name: Auto Renew HYEHOST
+name: Auto gaming4free-renew
 
 on:
   workflow_dispatch:

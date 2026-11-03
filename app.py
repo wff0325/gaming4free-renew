@@ -278,9 +278,16 @@ def _click_cf_checkbox(page, frame_el=None):
     except Exception:
         return False
 
-def _get_turnstile_token(page):
+# 缓存最近一次拿到的 Turnstile token。
+# 原因: 前端可能在验证成功后立刻自动提交并重置 widget, 导致随后读取时 token 已被消费。
+TOKEN_CACHE = {"v": None, "at": 0}
+
+def _get_turnstile_token(page, allow_cache=False):
+    """读取 Turnstile token。allow_cache=True 时, 若实时读取为空则回退到最近缓存
+    (token 有效期约 300 秒, 缓存 240 秒内仍可用)"""
+    tok = None
     try:
-        return page.evaluate("""() => {
+        tok = page.evaluate("""() => {
             if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
                 let t = null;
                 try { t = window.turnstile.getResponse(); } catch(e) {}
@@ -295,7 +302,13 @@ def _get_turnstile_token(page):
             return null;
         }""")
     except Exception:
-        return None
+        tok = None
+    if tok:
+        TOKEN_CACHE.update({"v": tok, "at": time.time()})
+        return tok
+    if allow_cache and TOKEN_CACHE["v"] and (time.time() - TOKEN_CACHE["at"]) < 240:
+        return TOKEN_CACHE["v"]
+    return None
 
 def _captcha_pending(page):
     try:
@@ -370,7 +383,7 @@ def solve_turnstile(page, timeout=180, max_clicks=3, grace=30):
             return True
 
     # 2) 先静等几秒: Turnstile 有时无需点击会自动通过
-    for _ in range(8):
+    for _ in range(5):
         if _get_turnstile_token(page):
             log("Turnstile 自动通过")
             return True
@@ -555,25 +568,68 @@ def _api_vote(page, slug, ign):
                "hours_remaining":12.2,"vote_count_today":16,...}
     冷却返回: 429 {"error":"Please wait 5 more minute(s) — or watch an ad to extend sooner."}
     """
-    token = _get_turnstile_token(page)
-    if not token:
-        return None
+    cached = TOKEN_CACHE["v"] if (TOKEN_CACHE["v"] and (time.time() - TOKEN_CACHE["at"]) < 240) else None
+    # 同时从页面取一次 token(Python 侧), 供 request 兜底使用
+    py_token = _get_turnstile_token(page, allow_cache=True)
     try:
+        # 关键: 取 token 与提交放在**同一次 JS 执行**里, 避免 token 在两次调用间被前端重置
         res = page.evaluate("""async (args) => {
-            const {slug, ign, token} = args;
+            const {slug, ign, cached} = args;
+            let token = null;
+            try {
+                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                    token = window.turnstile.getResponse() || null;
+                    if (!token) {
+                        for (let i = 0; i < 5; i++) {
+                            try { token = window.turnstile.getResponse(String(i)); } catch(e) {}
+                            if (token && token.length > 30) break;
+                        }
+                    }
+                }
+                if (!token) {
+                    const inp = document.querySelector('input[name="cf-turnstile-response"]');
+                    if (inp && inp.value && inp.value.length > 30) token = inp.value;
+                }
+            } catch (e) {}
+            if (!token && cached) token = cached;
+            if (!token) return {error: 'no-token'};
             try {
                 const r = await fetch(
                     `https://control.gaming4free.net/api/servers/${slug}/vote`,
                     {method: 'POST',
                      headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
                      body: JSON.stringify({ign: ign, 'cf-turnstile-response': token})});
-                return {status: r.status, body: (await r.text()).slice(0, 500)};
-            } catch (e) { return {error: String(e)}; }
-        }""", {"slug": slug, "ign": ign, "token": token})
+                return {status: r.status, body: (await r.text()).slice(0, 500),
+                        tokenLen: token.length, usedCache: !!(cached && token === cached)};
+            } catch (e) { return {error: String(e).slice(0, 200)}; }
+        }""", {"slug": slug, "ign": ign, "cached": cached})
+        log(f"[{slug}] 接口返回: {json.dumps(res, ensure_ascii=False)[:400]}")
         if res and res.get("body"):
             LAST_VOTE_RESP.update({"status": res.get("status"),
                                    "body": res["body"], "at": time.time()})
             log(f"投票API: {res.get('status')} {res['body'][:300]}")
+            return res
+
+        # 兜底2: 页面内 fetch 失败(常见 "TypeError: Failed to fetch" = CORS/被拦),
+        # 改用 Playwright 的 request context 直接发请求(不受浏览器 CORS 限制)
+        if py_token or cached:
+            try:
+                import json as _json
+                r = page.request.post(
+                    f"https://control.gaming4free.net/api/servers/{slug}/vote",
+                    data=_json.dumps({"ign": ign,
+                                      "cf-turnstile-response": py_token or cached}),
+                    headers={"Content-Type": "application/json",
+                             "Accept": "application/json",
+                             "Origin": BASE_URL,
+                             "Referer": BASE_URL + "/"})
+                body = r.text()[:400]
+                log(f"[{slug}] request 兜底: {r.status} {body[:200]}")
+                if body:
+                    LAST_VOTE_RESP.update({"status": r.status, "body": body, "at": time.time()})
+                return {"status": r.status, "body": body, "via": "request"}
+            except Exception as e:
+                log(f"[{slug}] request 兜底失败: {e}")
         return res
     except Exception as e:
         log(f"API 提交异常: {e}")
@@ -642,7 +698,7 @@ def vote_server(page, server, ign):
         log(f"[{slug}] 打开服务器页...")
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
-        time.sleep(5)
+        time.sleep(3)
 
         _dismiss_adblock_overlay(page)
         time.sleep(1)
@@ -668,7 +724,7 @@ def vote_server(page, server, ign):
         # 打开投票弹窗
         log(f"[{slug}] 点击 VOTE 按钮...")
         page.locator('#sd-vote-btn').first.click(timeout=10000)
-        time.sleep(4)
+        time.sleep(3)
 
         modal = page.evaluate("""() => {
             const m = document.querySelector('.vote-modal');
@@ -735,6 +791,15 @@ def vote_server(page, server, ign):
         LAST_VOTE_RESP.update({"status": None, "body": None, "at": 0})
         _api_vote(page, slug, ign)
 
+        # API 已明确成功时立即返回, 不必再等页面刷新(省 20 秒)
+        api_early = _vote_api_data()
+        if api_early.get("success") is True:
+            gain = api_early.get("minutes_per_vote")
+            after_early = _fmt_hours(api_early.get("hours_remaining")) or before_txt
+            log(f"[{slug}] 投票成功! {before_txt} -> {after_early}"
+                + (f"（+{gain} 分钟）" if gain else ""))
+            return True, before_txt, after_early
+
         if not LAST_VOTE_RESP.get("body"):
             # 兜底: 点击提交按钮(前端慢, 最多等 15 秒)
             log(f"[{slug}] 直接接口无响应，改用点击提交按钮...")
@@ -742,7 +807,7 @@ def vote_server(page, server, ign):
                 page.locator('#vm-submit').first.click(timeout=10000)
             except Exception as e:
                 log(f"[{slug}] 点击提交失败: {e}")
-            for _ in range(8):
+            for _ in range(15):
                 time.sleep(2)
                 if LAST_VOTE_RESP.get("body"):
                     break
@@ -790,6 +855,13 @@ def vote_server(page, server, ign):
 
         if verdict in ("cooldown", "cap"):
             log(f"[{slug}] 服务端拒绝（{verdict}），视为冷却/上限，跳过")
+            return "NOT_TIME", before_txt, after_txt
+
+        # API 返回 HTML(通常 403) = Cloudflare 拦截页, 说明当前出口 IP 被风控
+        body_raw = (LAST_VOTE_RESP.get("body") or "").lstrip()
+        if body_raw.startswith("<"):
+            log(f"[{slug}] 接口返回 HTML 拦截页（HTTP {LAST_VOTE_RESP.get('status')}），"
+                f"当前出口 IP 可能被 Cloudflare 风控，本次跳过")
             return "NOT_TIME", before_txt, after_txt
 
         # 提交后既无成功标志也无 API 响应: 多半是前端冷却拦截(请求未发出)

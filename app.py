@@ -68,6 +68,9 @@ if os.environ.get('G4F_NO_PROXY', '').lower() == 'true':
     IS_PROXY = False
 BROWSER_CHANNEL = os.environ.get('BROWSER_CHANNEL') or ""
 SECURITY_TIMEOUT = int(os.environ.get('SECURITY_TIMEOUT') or "240")
+# 单次运行连续投票次数与间隔(实测冷却 5 分钟)
+VOTES_PER_RUN = int(os.environ.get('G4F_VOTES_PER_RUN') or "2")
+VOTE_INTERVAL = int(os.environ.get('G4F_VOTE_INTERVAL') or "330")
 
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
@@ -517,9 +520,10 @@ def _vote_button_state(page):
 
 # ==================== 投票 API 响应捕获 ====================
 LAST_VOTE_RESP = {"status": None, "body": None, "at": 0}
+CONSOLE_LOG = []
 
 def _attach_vote_listener(page):
-    """监听投票 API 响应, 用于精确判断成功/冷却/失败(页面无可见提示)"""
+    """监听投票 API 响应 + 前端报错, 用于精确判断成功/冷却/失败(页面无可见提示)"""
     def on_resp(r):
         try:
             if '/vote' not in r.url.lower() or r.request.method != 'POST':
@@ -533,6 +537,47 @@ def _attach_vote_listener(page):
         except Exception:
             pass
     page.on("response", on_resp)
+
+    def on_console(m):
+        try:
+            if m.type in ("error", "warning"):
+                CONSOLE_LOG.append(f"{m.type}: {(m.text or '')[:180]}")
+                del CONSOLE_LOG[:-20]
+        except Exception:
+            pass
+    page.on("console", on_console)
+
+def _api_vote(page, slug, ign):
+    """在页面内直接 fetch 投票接口(实测比点提交按钮更可靠、更快)。
+
+    请求体格式(实测确认): {"ign": "...", "cf-turnstile-response": "<token>"}
+    成功返回: {"success":true,"message":"30 minutes added!","minutes_per_vote":30,
+               "hours_remaining":12.2,"vote_count_today":16,...}
+    冷却返回: 429 {"error":"Please wait 5 more minute(s) — or watch an ad to extend sooner."}
+    """
+    token = _get_turnstile_token(page)
+    if not token:
+        return None
+    try:
+        res = page.evaluate("""async (args) => {
+            const {slug, ign, token} = args;
+            try {
+                const r = await fetch(
+                    `https://control.gaming4free.net/api/servers/${slug}/vote`,
+                    {method: 'POST',
+                     headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+                     body: JSON.stringify({ign: ign, 'cf-turnstile-response': token})});
+                return {status: r.status, body: (await r.text()).slice(0, 500)};
+            } catch (e) { return {error: String(e)}; }
+        }""", {"slug": slug, "ign": ign, "token": token})
+        if res and res.get("body"):
+            LAST_VOTE_RESP.update({"status": res.get("status"),
+                                   "body": res["body"], "at": time.time()})
+            log(f"投票API: {res.get('status')} {res['body'][:300]}")
+        return res
+    except Exception as e:
+        log(f"API 提交异常: {e}")
+        return None
 
 def _vote_success_text(page):
     """弹窗内出现成功文案: '30 minutes added! Thanks for supporting the server, xxx!'"""
@@ -684,9 +729,23 @@ def vote_server(page, server, ign):
             page.screenshot(path=f"vote_submit_disabled_{slug}.png")
             return False, before_txt, before_txt
 
-        log(f"[{slug}] 提交投票...")
+        # 优先直接调用投票接口(实测: 前端点提交会卡在 "Submitting…", 请求很慢;
+        # 直接 fetch 更快更可靠。请求体格式已实测确认)
+        log(f"[{slug}] 提交投票（直接调用接口）...")
         LAST_VOTE_RESP.update({"status": None, "body": None, "at": 0})
-        page.locator('#vm-submit').first.click(timeout=10000)
+        _api_vote(page, slug, ign)
+
+        if not LAST_VOTE_RESP.get("body"):
+            # 兜底: 点击提交按钮(前端慢, 最多等 15 秒)
+            log(f"[{slug}] 直接接口无响应，改用点击提交按钮...")
+            try:
+                page.locator('#vm-submit').first.click(timeout=10000)
+            except Exception as e:
+                log(f"[{slug}] 点击提交失败: {e}")
+            for _ in range(8):
+                time.sleep(2)
+                if LAST_VOTE_RESP.get("body"):
+                    break
 
         # 等待成功文案或票数刷新(页面提示有延迟, 最多等 20 秒)
         success_text = False
@@ -792,8 +851,17 @@ def main():
 
             results = []
             for svc in servers:
-                result, before, after = vote_server(page, svc, ign)
-                results.append((svc["slug"], result, before, after))
+                # 单次运行可连续投多次(每次 +30 分钟, 冷却约 5 分钟)
+                last = ("NOT_TIME", "未知", "未知")
+                for n in range(max(1, VOTES_PER_RUN)):
+                    result, before, after = vote_server(page, svc, ign)
+                    last = (result, before, after)
+                    if result is not True:
+                        break
+                    if n < VOTES_PER_RUN - 1:
+                        log(f"等待 {VOTE_INTERVAL}s 冷却后继续投票（{n + 2}/{VOTES_PER_RUN}）...")
+                        time.sleep(VOTE_INTERVAL)
+                results.append((svc["slug"],) + last)
 
             has_fail = any(r[1] is False for r in results)
             for slug, result, before, after in results:

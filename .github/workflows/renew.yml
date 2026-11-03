@@ -1,16 +1,16 @@
-name: Auto gaming4free-renew
+name: Auto Vote Gaming4Free
 
 on:
   workflow_dispatch:
   schedule:
-    # 免费主机每 30 天需确认续期一次；默认每月 17 日运行(原到期日)
-    # cron 为 UTC 时间，北京时间 = UTC+8，例如 09:00 UTC = 北京时间 17:00
-    # 根据你的到期日修改：服务 17 号到期 -> '0 9 17 * *'
-    - cron: '0 9 17 * *'
+    # 单次投票 +30 分钟(API 返回 minutes_per_vote=30), 站点上限 48h
+    # 每小时跑一次 => 每小时 +30 分钟, 但自然消耗 60 分钟/小时, 剩余会缓慢下降
+    # 已达上限或冷却中时脚本正常退出(exit 0)
+    # cron 为 UTC, 北京时间 = UTC+8
+    - cron: '0 * * * *'
 
-# 防止同一时间运行多个任务导致 push 冲突
 concurrency:
-  group: renew-hyehost-group
+  group: vote-gaming4free-group
   cancel-in-progress: false
 
 permissions:
@@ -18,9 +18,9 @@ permissions:
   actions: write
 
 jobs:
-  renew-hyehost:
+  vote-gaming4free:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -48,11 +48,10 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 🚀 运行续期脚本
+      - name: 🚀 运行投票脚本
         env:
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-          SERVICE_URL: ${{ secrets.SERVICE_URL }}
+          G4F_SERVERS: ${{ secrets.G4F_SERVERS }}
+          G4F_IGN: ${{ secrets.G4F_IGN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
@@ -68,8 +67,8 @@ jobs:
             echo "No need to commit"
           else
             git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
-            # 自动变基同步并重试，避免 push 被 reject
-            for i in {1..2..3}; do
+            # 最多重试 3 次推送(原写法 {1..2..3} 步长3 只会展开为 1, 等于不重试)
+            for i in 1 2 3; do
               git pull --rebase origin main && git push origin main && break || sleep 2
             done
           fi

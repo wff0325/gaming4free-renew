@@ -68,8 +68,8 @@ if os.environ.get('G4F_NO_PROXY', '').lower() == 'true':
     IS_PROXY = False
 BROWSER_CHANNEL = os.environ.get('BROWSER_CHANNEL') or ""
 SECURITY_TIMEOUT = int(os.environ.get('SECURITY_TIMEOUT') or "240")
-# 单次运行连续投票次数与间隔(实测冷却 5 分钟)
-VOTES_PER_RUN = int(os.environ.get('G4F_VOTES_PER_RUN') or "2")
+# 单次运行投票次数(默认 1 次, 投完即退出; 需要连投再调大)
+VOTES_PER_RUN = int(os.environ.get('G4F_VOTES_PER_RUN') or "1")
 VOTE_INTERVAL = int(os.environ.get('G4F_VOTE_INTERVAL') or "330")
 
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
@@ -354,14 +354,13 @@ def handle_cloudflare(page, timeout=None):
     log("CF 验证超时")
     return False
 
-def solve_turnstile(page, timeout=180, max_clicks=3, grace=30):
+def solve_turnstile(page, timeout=240, max_clicks=4, grace=40):
     """处理页面内嵌 Turnstile(投票弹窗内)。
 
     核心原则: **点一次就耐心等**。
-    Turnstile 点击后由 Cloudflare 后台解题, 需 10~30 秒(机房/代理 IP 更慢);
-    解题过程中重复点击会中断并重置挑战, 表现为"点了几十次永远不通过"。
-    仅在 (a) 检测到验证过期/失败, 或 (b) 静默等待超过 grace 秒仍无 token 时,
-    才做有限次重试(最多 max_clicks 次)。
+    Turnstile 点击后由 Cloudflare 后台解题, 需 10~30 秒; 代理/机房 IP 更慢
+    (实测代理下需 60~80 秒)。解题过程中重复点击会中断并重置挑战, 表现为
+    "点了几十次永远不通过"。仅在静默等待超过 grace 秒仍无 token 时才有限重试。
     """
     if _get_turnstile_token(page):
         return True
@@ -750,7 +749,7 @@ def vote_server(page, server, ign):
         time.sleep(1)
 
         # 过 Turnstile(失败则刷新页面重试一次: 组件偶发不渲染)
-        if not solve_turnstile(page, timeout=120):
+        if not solve_turnstile(page, timeout=200):
             log(f"[{slug}] Turnstile 未渲染/未通过，刷新页面重试一次...")
             try:
                 page.reload(wait_until="domcontentloaded", timeout=60000)
@@ -767,7 +766,7 @@ def vote_server(page, server, ign):
                 time.sleep(1)
             except Exception as e:
                 log(f"[{slug}] 刷新重试异常: {e}")
-            if not solve_turnstile(page, timeout=150):
+            if not solve_turnstile(page, timeout=180):
                 log(f"[{slug}] Turnstile 仍未通过，放弃本次")
                 page.screenshot(path=f"vote_captcha_fail_{slug}.png")
                 return False, before_txt, before_txt

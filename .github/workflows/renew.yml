@@ -2,12 +2,12 @@ name: Auto Vote Gaming4Free
 
 on:
   workflow_dispatch:
-  schedule:
+  #schedule:
     # 单次投票 +30 分钟(API 返回 minutes_per_vote=30), 站点上限 48h
     # 每小时跑一次 => 每小时 +30 分钟, 但自然消耗 60 分钟/小时, 剩余会缓慢下降
     # 已达上限或冷却中时脚本正常退出(exit 0)
     # cron 为 UTC, 北京时间 = UTC+8
-    - cron: '0 * * * *'
+   # - cron: '0 * * * *'
 
 concurrency:
   group: vote-gaming4free-group

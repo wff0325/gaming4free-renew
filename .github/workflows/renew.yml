@@ -40,22 +40,17 @@ jobs:
           pip install patchright requests 'requests[socks]'
           python -m patchright install --with-deps chrome
 
-      # 说明: 本仓库目标是境外公开站点(gaming4free.net), runner 直连即可。
-      # 实测机房代理 IP 反而更容易被 Cloudflare 判定为高风险(Turnstile 反复不通过),
-      # 因此这里**不启用** sing-box 代理。如需代理, 自行取消下面步骤注释并配 G4F_NODE_LINK。
-      #
-      # - name: ⚙ 设置sing-box代理(可选)
-      #   continue-on-error: true
-      #   env:
-      #     NODE_LINK: ${{ secrets.G4F_NODE_LINK }}
-      #   run: |
-      #     bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+      - name: ⚙ 设置sing-box代理
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: 🚀 运行投票脚本
         env:
           G4F_SERVERS: ${{ secrets.G4F_SERVERS }}
           G4F_IGN: ${{ secrets.G4F_IGN }}
-          G4F_NO_PROXY: 'true'
           # 单次运行投票次数与间隔(冷却约 5 分钟, 330s 留余量)
           G4F_VOTES_PER_RUN: '2'
           G4F_VOTE_INTERVAL: '330'

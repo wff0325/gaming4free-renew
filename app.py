@@ -597,7 +597,9 @@ def _api_vote(page, slug, ign):
                     `https://control.gaming4free.net/api/servers/${slug}/vote`,
                     {method: 'POST',
                      headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
-                     body: JSON.stringify({ign: ign, 'cf-turnstile-response': token})});
+                     body: JSON.stringify({'cf-turnstile-response': token,
+                                           'voter_name': ign,
+                                           'ad_watched': '0'})});
                 return {status: r.status, body: (await r.text()).slice(0, 500),
                         tokenLen: token.length, usedCache: !!(cached && token === cached)};
             } catch (e) { return {error: String(e).slice(0, 200)}; }
@@ -616,8 +618,9 @@ def _api_vote(page, slug, ign):
                 import json as _json
                 r = page.request.post(
                     f"https://control.gaming4free.net/api/servers/{slug}/vote",
-                    data=_json.dumps({"ign": ign,
-                                      "cf-turnstile-response": py_token or cached}),
+                    data=_json.dumps({"cf-turnstile-response": py_token or cached,
+                                      "voter_name": ign,
+                                      "ad_watched": "0"}),
                     headers={"Content-Type": "application/json",
                              "Accept": "application/json",
                              "Origin": BASE_URL,

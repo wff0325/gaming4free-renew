@@ -19,7 +19,7 @@ permissions:
 jobs:
   vote-gaming4free:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -51,9 +51,6 @@ jobs:
         env:
           G4F_SERVERS: ${{ secrets.G4F_SERVERS }}
           G4F_IGN: ${{ secrets.G4F_IGN }}
-          # 单次运行投票次数与间隔(冷却约 5 分钟, 330s 留余量)
-          G4F_VOTES_PER_RUN: '2'
-          G4F_VOTE_INTERVAL: '330'
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py

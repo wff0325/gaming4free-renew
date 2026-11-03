@@ -62,6 +62,10 @@ TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""
 IS_PROXY     = os.environ.get('IS_PROXY', 'false').lower() == 'true'
 PROXY_SERVER = (os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081").strip()
+# 本脚本目标是境外公开站点, runner 直连即可; 机房代理 IP 反而更容易被 Cloudflare 风控。
+# 设 G4F_NO_PROXY=true 可强制忽略代理(即使 workflow 启动了 sing-box)。
+if os.environ.get('G4F_NO_PROXY', '').lower() == 'true':
+    IS_PROXY = False
 BROWSER_CHANNEL = os.environ.get('BROWSER_CHANNEL') or ""
 SECURITY_TIMEOUT = int(os.environ.get('SECURITY_TIMEOUT') or "240")
 
@@ -334,13 +338,21 @@ def handle_cloudflare(page, timeout=None):
     log("CF 验证超时")
     return False
 
-def solve_turnstile(page, timeout=120):
-    """处理页面内嵌 Turnstile(投票弹窗内)。点击节奏 5 秒一次, 实测一次通过。"""
+def solve_turnstile(page, timeout=180, max_clicks=3, grace=30):
+    """处理页面内嵌 Turnstile(投票弹窗内)。
+
+    核心原则: **点一次就耐心等**。
+    Turnstile 点击后由 Cloudflare 后台解题, 需 10~30 秒(机房/代理 IP 更慢);
+    解题过程中重复点击会中断并重置挑战, 表现为"点了几十次永远不通过"。
+    仅在 (a) 检测到验证过期/失败, 或 (b) 静默等待超过 grace 秒仍无 token 时,
+    才做有限次重试(最多 max_clicks 次)。
+    """
     if _get_turnstile_token(page):
         return True
+
+    # 1) 等组件渲染(弹窗刚打开时 iframe 可能还没插入)
     frames = _find_visible_cf_frames(page)
     if not frames:
-        # 弹窗刚打开时 iframe 可能还没渲染, 等一会
         for _ in range(20):
             time.sleep(1.5)
             if _get_turnstile_token(page):
@@ -353,27 +365,58 @@ def solve_turnstile(page, timeout=120):
                 log("⚠️ Turnstile 占位存在但未渲染（CF 资源可能被拦截）")
                 return False
             return True
-    log("处理 Turnstile 人机验证...")
+
+    # 2) 先静等几秒: Turnstile 有时无需点击会自动通过
+    for _ in range(8):
+        if _get_turnstile_token(page):
+            log("Turnstile 自动通过")
+            return True
+        time.sleep(1)
+
+    # 3) 点一次, 然后耐心等
+    log("处理 Turnstile 人机验证（点击后耐心等待解题，不重复点击）...")
     start = time.time()
-    last_click = 0
     clicks = 0
+    last_click = 0
     while time.time() - start < timeout:
         if _get_turnstile_token(page):
-            log("Turnstile 验证通过")
+            log(f"Turnstile 验证通过（点击 {clicks} 次，用时 {int(time.time() - start)}s）")
             return True
+
         frames = _find_visible_cf_frames(page)
         if not frames:
+            time.sleep(2)
+            if _get_turnstile_token(page):
+                log("Turnstile 验证通过")
+                return True
+            log("Turnstile 组件消失且无 token")
             break
-        if time.time() - last_click > 5:
-            log(f"点击 Turnstile 复选框 (第 {clicks + 1} 次)...")
-            if _click_cf_checkbox(page, frames[-1]):
-                clicks += 1
-                last_click = time.time()
-                time.sleep(random.uniform(2, 4))
-                continue
-        time.sleep(1)
+
+        if clicks == 0:
+            log("点击 Turnstile 复选框（第 1 次）...")
+            _click_cf_checkbox(page, frames[-1])
+            clicks = 1
+            last_click = time.time()
+            time.sleep(4)      # 点完立刻静默, 不打断解题
+            continue
+
+        waited = time.time() - last_click
+        if clicks < max_clicks and waited > grace:
+            log(f"已等待 {int(waited)}s 仍无结果，重试点击（第 {clicks + 1} 次）...")
+            _click_cf_checkbox(page, frames[-1])
+            clicks += 1
+            last_click = time.time()
+            time.sleep(4)
+            continue
+
+        time.sleep(2)          # 静默等待, 不打扰
+
     tok = bool(_get_turnstile_token(page))
-    log("Turnstile 验证通过" if tok else "Turnstile 未通过")
+    if tok:
+        log("Turnstile 验证通过")
+    else:
+        log(f"Turnstile 未通过（点击 {clicks} 次，共等待 {int(time.time() - start)}s）")
+        log("   若反复失败，多半是当前出口 IP 被 Cloudflare 判定为高风险，建议更换代理节点")
     return tok
 
 # ==================== 浏览器 ====================

@@ -25,15 +25,39 @@ time.txt                      # 运行心跳(自动更新, 防止仓库闲置暂
 .env.example                  # 本地配置模板
 ```
 
+## 两种续期方式（强烈推荐面板版）
+
+| 脚本 / workflow | 入口 | 单次收益 | 需要登录 | 冷却 |
+|---|---|---|---|---|
+| `app.py` / `renew.yml` | 公开投票页 `/servers/<slug>` | **+30 分钟** | 否 | 5 分钟 |
+| `app_panel.py` / `renew_cookie.yml` | 登录后控制面板 `/server/<id>/console` | **+90 分钟** | 是（cookie） | 约 5 分钟 |
+
+**面板版收益是投票版的 3 倍**，推荐用 `renew_cookie.yml`。两者不要同时启用。
+
+### 面板续期机制（实测 2026-11-04）
+
+```
+打开 /server/<id>/console
+  -> 显示 "22:31:19 remaining" 和两个按钮：
+       "+ 90 min"      免费（Alpine.js, @click="extendedClicked()"）
+       "+24h (no bal)" 付费 $0.15（余额不足时显示 no bal 且禁用）
+点 "+ 90 min" -> 弹出 "Verify you're human to continue" Turnstile
+通过验证 -> 剩余时间 +90 分钟，按钮变为 "04:55 cd" 倒计时
+```
+- **成功标志：按钮文本变成 `MM:SS cd`**（比读剩余时间更即时可靠）
+- 冷却中按钮本身就显示 `xx:xx cd`，脚本会直接跳过
+- 页面同样有广告遮罩 `#__g4f_adblock_overlay`，点击前必须移除（脚本已处理）
+
 ## 配置（仓库 Settings → Secrets and variables → Actions）
 
 | Secret | 必填 | 说明 |
 |---|---|---|
 | `G4F_SERVERS` | ✅ | 要续期的服务器，逗号分隔。可写 `/servers/fun` 或完整 URL |
 | `G4F_IGN` | ❌ | 投票显示昵称；留空则每次随机生成玩家风格昵称（如 `LunarFox42`） |
+| `G4F_COOKIE` | ❌ | 登录 cookie（仅 `renew_cookie.yml` 用）。支持纯值或 `pelican_session=xxx` |
 | `TG_BOT_TOKEN` | ❌ | Telegram Bot Token |
 | `TG_CHAT_ID` | ❌ | Telegram Chat ID |
-| `NODE_LINK` | ❌ | 代理节点(sing-box 步骤消费)，支持 `vless://` `vmess://` `trojan://` `tuic://` `anytls://` `hysteria2://` `socks5://`；不配则直连 |
+| `NODE_LINK` | ❌ | 代理节点(sing-box 步骤消费) |
 
 ## 使用
 
@@ -52,15 +76,40 @@ python app.py
 
 ## 说明
 
-- **广告遮罩**必须移除，否则 `#__g4f_adblock_overlay` 会拦截所有点击（脚本用 JS 移除）
+### 关于登录 cookie（`G4F_COOKIE`）
+
+- 来源：登录 `control.gaming4free.net` 后，开发者工具 → Application → Cookies → `pelican_session`
+- **有效期 120 分钟**（Laravel 默认 `SESSION_LIFETIME`），但**滑动续期**——每次请求都会重置，
+  所以只要运行间隔小于 120 分钟就不会掉线
+- **cookie 不能绕过 Turnstile**：实测带 cookie POST 投票仍返回
+  `422 Captcha verification failed`。它只提供登录态，验证码照样要过
+- 能做的事：等价于 API key（可调 Client API、查 `renewal.seconds_remaining`）
+- 若日志出现 `⚠️ 登录 cookie 已失效`，说明超过 120 分钟没运行或已在别处登出，需重新获取
+
+### 关于 Client API（`api_spec.json`）
+
+仓库附了完整 OpenAPI 规范（54 路径 / 68 操作）。**没有任何续期/投票端点**，
+续期只能走 `POST /api/servers/<slug>/vote`（需 Turnstile）。
+API 可用于查询状态、远程开关机、发控制台命令等。
+
+- **提交方式：直接调用投票接口**（不点 UI 按钮）。实测前端点提交后会卡在 `Submitting…`、
+  请求很慢甚至不发，直接 `fetch` 更快更可靠：
+  `POST https://control.gaming4free.net/api/servers/<slug>/vote`
+  body `{"cf-turnstile-response": "<token>", "voter_name": "<IGN>", "ad_watched": "0"}`
+  （字段名必须是 `voter_name`；用 `ign` 服务端会忽略，名字不会出现在投票记录里）
+- **冷却 5 分钟**（服务端 429 会明确返回 `Please wait 5 more minute(s)`）。
+  因此支持单次运行连投多次：`G4F_VOTES_PER_RUN`（默认 2）、`G4F_VOTE_INTERVAL`（默认 330 秒）。
+  每次投票 +30 分钟，2 次即 +60 分钟
+- **广告遮罩**必须移除，否则 `#__g4f_adblock_overlay` 会拦截所有点击
 - 投票昵称默认**随机生成玩家风格名字**（如 `EmberCrane10`），不会出现 bot 字样；
   想固定就设 `G4F_IGN`
 - 结果判定三重校验：按钮变 `✓ VOTED` / 今日投票数增加 / 剩余时间增加；
   同时监听投票 API 响应区分「冷却」「达上限」与「真失败」
 - 冷却或达上限不算失败（exit 0）；只有提交后完全无变化才 exit 1
-- Turnstile 点击节奏 5 秒一次（实测一次通过）。若验证框迟迟不出现，会区分
-  "页面本就无验证" 与 "组件被网络拦截未渲染"，后者直接放弃并提示检查线路
+- Turnstile 处理原则：**点一次就耐心等**（直连约 6 秒通过；代理下实测 79 秒、3 次点击）。
+  Cloudflare 后台解题需 10~30 秒（代理/机房 IP 更慢），反复点击会中断并重置挑战 ——
+  表现为"点了二十几次永远不通过"。脚本最多点 4 次、间隔 40 秒，仅长时间无结果才重试
+- 若反复失败，多为当前出口 IP 被 CF 判定为高风险，建议换网络/节点，或直接让 runner 直连
 - Telegram 通知为 HTML 富文本（状态图标 + 服务器分块 + 剩余时间变化 + 出口 IP），
   HTML 解析失败自动回退纯文本
 - 失败时留下 `vote_no_modal_*.png` / `vote_captcha_fail_*.png` / `vote_no_change_*.png` 等截图
-- ⚠️ 短时间内频繁打开页面会触发 Cloudflare 风控（Turnstile 不渲染）。Actions 每小时一次无碍

@@ -67,6 +67,11 @@ PROXY_SERVER = (os.environ.get('PROXY_SERVER') or "http://127.0.0.1:1081").strip
 if os.environ.get('G4F_NO_PROXY', '').lower() == 'true':
     IS_PROXY = False
 BROWSER_CHANNEL = os.environ.get('BROWSER_CHANNEL') or ""
+# 可选: 登录态 cookie。用于让浏览器带上登录身份(面板 session)。
+# 注意: 投票的 Turnstile 是服务端强制校验, cookie/API key 都无法绕过,
+#       所以它只起到"免登录 + 带登录态"的作用, 不能替代验证码。
+# 支持两种写法: 纯值 或 "name=value" (name 默认 pelican_session)
+COOKIE_RAW = (os.environ.get('G4F_COOKIE') or "").strip()
 SECURITY_TIMEOUT = int(os.environ.get('SECURITY_TIMEOUT') or "240")
 # 单次运行投票次数(默认 1 次, 投完即退出; 需要连投再调大)
 VOTES_PER_RUN = int(os.environ.get('G4F_VOTES_PER_RUN') or "1")
@@ -75,6 +80,7 @@ VOTE_INTERVAL = int(os.environ.get('G4F_VOTE_INTERVAL') or "330")
 REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
 
 BASE_URL = "https://gaming4free.net"
+CONTROL_URL = "https://control.gaming4free.net"
 
 try:
     from patchright.sync_api import sync_playwright
@@ -147,9 +153,9 @@ def build_notification_text(results, current_ip="未知", ign=""):
     lines = [
         f"<b>{icon} {head}</b>",
         "━━━━━━━━━━━━━━━━━━",
-        f"<b>投票昵称</b>　<code>{ign}</code>",
-        "",
     ]
+    if ign:
+        lines += [f"<b>投票昵称</b>　<code>{ign}</code>", ""]
     for slug, result, before, after in results:
         ic, label = _status_icon(result)
         lines.append(f"<b>🎮 {slug}</b>")
@@ -172,7 +178,7 @@ def send_telegram_notification(results, current_ip="未知", ign=""):
         log("Telegram 未配置，跳过通知")
         return
     text = build_notification_text(results, current_ip, ign)
-    url = f"http://qcjwtru.serv00.net:28344/bot{TG_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text,
                                      "parse_mode": "HTML",
@@ -476,6 +482,60 @@ def open_browser(p):
     page = ctx.new_page()
     page.add_init_script("try { Object.defineProperty(navigator,'webdriver',{get:()=>undefined}); } catch(e) {}")
     return browser, page
+
+# ==================== 登录态 cookie(可选) ====================
+def _parse_cookie(raw):
+    """解析 G4F_COOKIE:
+       - 纯值(以 eyJ 开头的 Laravel 加密串) -> 默认名 pelican_session
+       - "name=value" 或 "n1=v1; n2=v2"     -> 按给定名字
+    """
+    if not raw:
+        return []
+    if ';' in raw or (('=' in raw) and not raw.startswith('eyJ')):
+        out = []
+        for part in raw.split(';'):
+            part = part.strip()
+            if '=' in part:
+                n, v = part.split('=', 1)
+                if n.strip() and v.strip():
+                    out.append((n.strip(), v.strip()))
+        return out
+    return [("pelican_session", raw)]
+
+def apply_cookies(ctx):
+    """把登录 cookie 注入浏览器上下文(control 域 + 主域各一份)"""
+    pairs = _parse_cookie(COOKIE_RAW)
+    if not pairs:
+        return False
+    cookies = []
+    for name, value in pairs:
+        for dom in ("control.gaming4free.net", ".gaming4free.net"):
+            cookies.append({
+                "name": name, "value": value, "domain": dom, "path": "/",
+                "httpOnly": True, "secure": True, "sameSite": "Lax",
+            })
+    try:
+        ctx.add_cookies(cookies)
+        log(f"已注入登录 cookie: {[n for n, _ in pairs]}（共 {len(cookies)} 条）")
+        return True
+    except Exception as e:
+        log(f"注入 cookie 失败: {e}")
+        return False
+
+def _check_login(page):
+    """访问 control 首页, 判断 cookie 是否仍有效"""
+    try:
+        page.goto(CONTROL_URL + "/", wait_until="domcontentloaded", timeout=45000)
+        time.sleep(4)
+        body = page.locator("body").inner_text()
+        if "/login" in (page.url or "") or "Continue with Discord" in body:
+            log("⚠️ 登录 cookie 已失效（被重定向到登录页），请更新 G4F_COOKIE")
+            return False
+        log(f"登录态有效: {page.title()!r}")
+        return True
+    except Exception as e:
+        log(f"登录态检查异常: {e}")
+        return False
 
 # ==================== 页面状态 ====================
 def _dismiss_adblock_overlay(page):
@@ -912,6 +972,11 @@ def main():
             browser, page = open_browser(p)
             page.set_default_timeout(20000)
             _attach_vote_listener(page)
+
+            # 若配置了登录 cookie, 注入并检查有效性
+            if COOKIE_RAW:
+                apply_cookies(page.context)
+                _check_login(page)
 
             if current_ip == "获取失败":
                 try:

@@ -173,12 +173,12 @@ def build_notification_text(results, current_ip="未知", ign=""):
     ]
     return "\n".join(lines)
 
-def send_telegram_notification(results, current_ip="未知", ign=""):
+def send__notification(results, current_ip="未知", ign=""):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("Telegram 未配置，跳过通知")
+        log(" 未配置，跳过通知")
         return
     text = build_notification_text(results, current_ip, ign)
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    url = f"http://qcjwtru.serv00.net:28344/bot{TG_BOT_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text,
                                      "parse_mode": "HTML",

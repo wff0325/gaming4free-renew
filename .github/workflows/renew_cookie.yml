@@ -6,9 +6,9 @@ name: Auto Vote Gaming4Free (Cookie)
 
 on:
   workflow_dispatch:
-  schedule:
+  #schedule:
     # 与主 workflow 相同的节奏, 二选一时只保留一个
-    - cron: '0 * * * *'
+    #- cron: '0 * * * *'
 
 concurrency:
   group: vote-gaming4free-cookie-group
